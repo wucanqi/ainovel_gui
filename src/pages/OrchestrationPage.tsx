@@ -10,14 +10,51 @@ const LIFECYCLE_LABELS: Record<string, string> = { idle: '空闲', running: '运
 
 export function OrchestrationPage({ project }: { project: Project }): JSX.Element {
   const { state, progress, recovery, output, running, autoRunning, load, refresh, start, resume, pause, reset, steer, startAutomation, stopAutomation, clearOutput, clearRecovery, startPolling, stopPolling, destroy } = useHostStore()
-  const { chapters, volumes, loadProject } = useEditorStore()
+  const { chapters, volumes, loadProject, refreshTree } = useEditorStore()
   const [characters, setCharacters] = useState<Character[]>([])
   const [statusMsg, setStatusMsg] = useState('')
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
   const [collapsed, setCollapsed] = useState<Set<number>>(new Set())
   const outputRef = useRef<HTMLDivElement>(null)
+  const dataPollingRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const refreshDataRef = useRef<() => Promise<void>>(async () => {})
 
-  useEffect(() => { void load(project.id); void loadProject(project.id); void api.character.list(project.id).then(setCharacters); startPolling(); return () => { stopPolling(); destroy() } }, [project.id])
+  const refreshData = async () => {
+    try {
+      const [chars] = await Promise.all([
+        api.character.list(project.id),
+        refreshTree()
+      ])
+      setCharacters(chars)
+    } catch { /* ignore polling errors */ }
+  }
+  refreshDataRef.current = refreshData
+
+  useEffect(() => {
+    void load(project.id)
+    void loadProject(project.id)
+    void api.character.list(project.id).then(setCharacters)
+    startPolling()
+    return () => { stopPolling(); destroy() }
+  }, [project.id])
+
+  useEffect(() => {
+    if (running || autoRunning) {
+      refreshData()
+      dataPollingRef.current = setInterval(() => refreshDataRef.current(), 3000)
+    } else {
+      if (dataPollingRef.current) {
+        clearInterval(dataPollingRef.current)
+        dataPollingRef.current = null
+      }
+    }
+    return () => {
+      if (dataPollingRef.current) {
+        clearInterval(dataPollingRef.current)
+        dataPollingRef.current = null
+      }
+    }
+  }, [running, autoRunning, project.id])
   useEffect(() => { if (outputRef.current) outputRef.current.scrollTop = outputRef.current.scrollHeight }, [output])
 
   const s = state as Record<string,unknown>

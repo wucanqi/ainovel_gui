@@ -599,6 +599,25 @@ CREATE TABLE IF NOT EXISTS draft_gate_verdicts (
   created_at INTEGER NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_gate_verdict_draft ON draft_gate_verdicts(draft_id);
+
+CREATE TABLE IF NOT EXISTS plan_gate_verdicts (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  chapter_id TEXT NOT NULL,
+  plan_id TEXT NOT NULL,
+  verdict TEXT NOT NULL,
+  overall_passed INTEGER NOT NULL DEFAULT 0,
+  fail_count INTEGER NOT NULL DEFAULT 0,
+  critical_count INTEGER NOT NULL DEFAULT 0,
+  summary TEXT DEFAULT '',
+  recommended_model TEXT DEFAULT '',
+  reports_json TEXT DEFAULT '[]',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plan_gate_verdict_chapter ON plan_gate_verdicts(chapter_id);
+CREATE INDEX IF NOT EXISTS idx_plan_gate_verdict_project ON plan_gate_verdicts(project_id);
+
 CREATE TABLE IF NOT EXISTS model_routing_rules (
   id TEXT PRIMARY KEY,
   project_id TEXT,

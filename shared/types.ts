@@ -652,6 +652,7 @@ export interface RouteState {
   hasArcReview: boolean
   hasArcSummary: boolean
   hasVolumeSummary: boolean
+  hasVolumeReview: boolean
   foundationMissing: string[]
   chapterReadiness: {
     chapterId: string | null

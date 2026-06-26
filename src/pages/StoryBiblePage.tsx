@@ -570,24 +570,24 @@ function ImportManager({
   const handleFile = async (file: File): Promise<void> => {
     const text = await file.text()
     await api.import.document(projectId, file.name, text)
-    void refresh()
-    void onChanged?.()
+    await refresh()
+    await onChanged?.()
   }
 
   const handlePaste = async (): Promise<void> => {
     if (!pasteText.trim()) return
     await api.import.document(projectId, '粘贴文本.md', pasteText)
     setPasteText('')
-    void refresh()
-    void onChanged?.()
+    await refresh()
+    await onChanged?.()
   }
 
   const handleParse = async (docId: string): Promise<void> => {
     setParsing(true)
     try {
       await api.import.parseDocument(projectId, docId)
-      void refresh()
-      void onChanged()
+      await refresh()
+      await onChanged()
     } finally {
       setParsing(false)
     }
@@ -597,8 +597,8 @@ function ImportManager({
     setParsing(true)
     try {
       await api.import.parseAll(projectId)
-      void refresh()
-      void onChanged()
+      await refresh()
+      await onChanged()
     } finally {
       setParsing(false)
     }
@@ -617,13 +617,13 @@ function ImportManager({
 
   const handleMerge = async (segId: string): Promise<void> => {
     await api.import.mergeSegments(projectId, [segId])
-    void refresh()
-    void onChanged()
+    await refresh()
+    await onChanged()
   }
 
   const handleIgnore = async (segId: string): Promise<void> => {
     await api.bibleSegment.updateStatus(segId, 'ignored')
-    void refresh()
+    await refresh()
   }
 
   return (
@@ -720,7 +720,7 @@ function ImportManager({
                 <button
                   onClick={async () => {
                     await api.import.deleteDocument(projectId, doc.id)
-                    void refresh()
+                    await refresh()
                   }}
                   className="rounded px-2 py-1 text-rose-400 hover:bg-rose-500/10"
                 >
@@ -817,8 +817,8 @@ function GuidedMode({
         }))
       await api.guided.submitAnswers(projectId, answerList)
       setAnswers({})
-      void refresh()
-      void onChanged()
+      await refresh()
+      await onChanged()
     } finally {
       setSubmitting(false)
     }

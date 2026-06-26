@@ -115,6 +115,26 @@ function runMigrations(): void {
     db.exec("ALTER TABLE system_state ADD COLUMN pending_steer TEXT DEFAULT ''")
     console.log('[db] migration: added pending_steer to system_state')
   }
+  const pgvTable = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='plan_gate_verdicts'").get() as { name: string } | undefined
+  if (!pgvTable) {
+    db.exec(`CREATE TABLE plan_gate_verdicts (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      chapter_id TEXT NOT NULL,
+      plan_id TEXT NOT NULL,
+      verdict TEXT NOT NULL,
+      overall_passed INTEGER NOT NULL DEFAULT 0,
+      fail_count INTEGER NOT NULL DEFAULT 0,
+      critical_count INTEGER NOT NULL DEFAULT 0,
+      summary TEXT DEFAULT '',
+      recommended_model TEXT DEFAULT '',
+      reports_json TEXT DEFAULT '[]',
+      created_at INTEGER NOT NULL
+    )`)
+    db.exec('CREATE INDEX IF NOT EXISTS idx_plan_gate_verdict_chapter ON plan_gate_verdicts(chapter_id)')
+    db.exec('CREATE INDEX IF NOT EXISTS idx_plan_gate_verdict_project ON plan_gate_verdicts(project_id)')
+    console.log('[db] migration: created plan_gate_verdicts table')
+  }
 }
 
 export function initTestDb(): Database.Database {

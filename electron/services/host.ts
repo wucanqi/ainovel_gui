@@ -30,7 +30,11 @@ import type {
   JSONSchema,
   RouteState,
   OrchestratorState,
-  HostAction
+  HostAction,
+  GateCheckResult,
+  GateVerdictType,
+  GateCheckType,
+  GateSeverity
 } from '@shared/types'
 
 let toolInitDone = false
@@ -138,6 +142,14 @@ function inferHostOrchestratorState(state: RouteState, inst: Instruction | null)
   }
 
   if (state.arcBoundary?.isArcEnd) {
+    if (state.arcBoundary.isVolumeEnd) {
+      if (state.hasVolumeReview) return 'volume_review'
+      if (state.hasArcReview && state.hasArcSummary && state.hasVolumeSummary) {
+        return 'volume_review'
+      }
+      if (!state.hasArcReview) return 'arc_review_pending'
+      return 'arc_review'
+    }
     return state.hasArcReview ? 'arc_review' : 'arc_review_pending'
   }
 
@@ -341,6 +353,12 @@ function getLatestReviewRecord(projectId: string): {
 }
 
 function decideRecoveryAction(projectId: string, state: RouteState): HostAction | null {
+  const currentOrchestratorState = (stateField(projectId, 'orchestrator_state') as string) ?? null
+  const TRANSITION_STATES = new Set(['polishing', 'chapter_rewrite', 'draft_gate', 'plan_gate', 'contract_generation', 'volume_review'])
+  if (currentOrchestratorState && TRANSITION_STATES.has(currentOrchestratorState)) {
+    return null
+  }
+
   const chapterId = state.nextChapterId
   const latestSession = db().prepare(
     'SELECT agent_type, mode, status FROM agent_sessions WHERE project_id = ? ORDER BY created_at DESC LIMIT 1'
@@ -399,6 +417,16 @@ function decideRecoveryAction(projectId: string, state: RouteState): HostAction 
     }
   }
 
+  if (state.arcBoundary?.isVolumeEnd && state.hasArcReview && state.hasArcSummary && state.hasVolumeSummary && !state.hasVolumeReview) {
+    return {
+      type: 'recover',
+      reason: '已到卷末，弧级工作已完成但卷级评审未执行，恢复到卷评审待定状态',
+      targetState: 'volume_review',
+      agent: 'editor',
+      task: `对第${state.arcBoundary.volume}卷执行卷级评审（scope=volume）。弧级评审与摘要已完成，需要卷级 Editor 评估后方可进入下一卷规划或全书收尾。`
+    }
+  }
+
   if (latestSession?.status === 'aborted') {
     const recoveredAgent = normalizeHostAgent((latestSession.agent_type as Instruction['agent']) ?? null) ?? undefined
     return {
@@ -445,6 +473,68 @@ function countDraftFailuresForChapter(chapterId: string): number {
      WHERE d.chapter_id = ? AND v.overall_passed = 0`
   ).get(chapterId) as { c: number }
   return row.c
+}
+
+function countConsecutivePolishFailures(projectId: string, chapterId: string): number {
+  const rows = db().prepare(
+    `SELECT dgv.verdict FROM draft_gate_verdicts dgv
+     JOIN chapter_drafts d ON dgv.draft_id = d.id
+     WHERE d.project_id = ? AND d.chapter_id = ?
+     ORDER BY d.version DESC
+     LIMIT 10`
+  ).all(projectId, chapterId) as Array<{ verdict: string }>
+  let count = 0
+  for (const row of rows) {
+    if (row.verdict === 'polish') {
+      count++
+    } else {
+      break
+    }
+  }
+  return count
+}
+
+function rebuildGateActionFromVerdict(
+  projectId: string,
+  state: RouteState,
+  targetState: string
+): HostAction | null {
+  const chapterId = state.nextChapterId
+  if (!chapterId) return null
+
+  const latestDraft = getLatestDraftForRecovery(chapterId)
+  if (!latestDraft) return null
+
+  const verdictRow = db().prepare(
+    `SELECT id, verdict, summary, fail_count, critical_count, recommended_model
+     FROM draft_gate_verdicts
+     WHERE draft_id = ? AND chapter_id = ?
+     ORDER BY created_at DESC LIMIT 1`
+  ).get(latestDraft.id, chapterId) as Record<string, unknown> | undefined
+  if (!verdictRow) return null
+
+  const reportRows = db().prepare(
+    `SELECT check_type, violations FROM draft_gate_reports WHERE draft_id = ?`
+  ).all(latestDraft.id) as Array<{ check_type: string; violations: string }>
+
+  const reports: GateCheckResult[] = reportRows.map((r) => ({
+    check_type: r.check_type as GateCheckType,
+    passed: false,
+    severity: 'error' as GateSeverity,
+    violations: (() => { try { return JSON.parse(r.violations); } catch { return []; } })()
+  }))
+
+  const verdict: GateVerdict = {
+    verdict: verdictRow.verdict as GateVerdictType,
+    overall_passed: false,
+    fail_count: verdictRow.fail_count as number,
+    critical_count: verdictRow.critical_count as number,
+    summary: verdictRow.summary as string,
+    recommended_model: verdictRow.recommended_model as string,
+    reports
+  }
+
+  return buildDraftGateAction(projectId, chapterId, latestDraft.id, verdict)
 }
 
 function commitChapterFromGate(projectId: string, chapterId: string, draftId: string): void {
@@ -565,16 +655,36 @@ function buildDraftGateAction(projectId: string, chapterId: string, draftId: str
       }
     }
     case 'polish':
+      rejectDraft(draftId, verdict.summary)
+      const polishFailCount = countConsecutivePolishFailures(projectId, chapterId)
+      if (polishFailCount >= 2) {
+        return {
+          type: 'recover',
+          reason: `连续 ${polishFailCount} 次打磨未通过，升级为重写：${verdict.summary}`,
+          targetState: 'chapter_rewrite',
+          agent: 'writer',
+          task: `重写当前章节。连续 ${polishFailCount} 次打磨未通过门禁，说明需要更实质性的修改。问题摘要：${verdict.summary}。\n详细违规点：\n${reportText || '无'}\n重写时必须逐条规避这些问题，不得重复触发同类违规。`,
+          metadata: {
+            chapterId,
+            draftId,
+            verdict: 'rewrite',
+            recommendedModel: 'pro',
+            escalatedFrom: 'polish',
+            polishFailCount
+          }
+        }
+      }
       return {
         type: 'recover',
         reason: `Draft Gate 判定局部打磨：${verdict.summary}`,
         targetState: 'polishing',
         agent: 'writer',
-        task: `根据 Draft Gate 结论打磨当前章节草稿。chapter_id=${chapterId}，draft_id=${draftId}。问题摘要：${verdict.summary}。\n详细违规点：\n${reportText || '无'}\n逐条修复，不要重新起草整章。`,
+        task: `根据 Draft Gate 结论打磨当前章节草稿。上一版草稿已被门禁退回。问题摘要：${verdict.summary}。\n详细违规点：\n${reportText || '无'}\n逐条修复，不要重新起草整章。只修改涉及违规的段落，保持其他内容不变。`,
         metadata: {
           chapterId,
           draftId,
-          verdict: verdict.verdict
+          verdict: verdict.verdict,
+          recommendedModel: verdict.recommended_model
         }
       }
     case 'rewrite':
@@ -584,7 +694,7 @@ function buildDraftGateAction(projectId: string, chapterId: string, draftId: str
         reason: `Draft Gate 判定重写：${verdict.summary}`,
         targetState: 'chapter_rewrite',
         agent: 'writer',
-        task: `重写当前章节。chapter_id=${chapterId}。上一版草稿已被门禁拒绝。问题摘要：${verdict.summary}。\n详细违规点：\n${reportText || '无'}\n重写时必须逐条规避这些问题。`,
+        task: `重写当前章节。chapter_id=${chapterId}。上一版草稿已被门禁拒绝。问题摘要：${verdict.summary}。\n详细违规点：\n${reportText || '无'}\n重写要求：如果违规类型是 missing_beat（缺失必要节拍），必须将这些节拍作为新段落写入正文——不是修改已有内容，而是新增缺失的场景。其他违规逐条规避。保留上一版中通过门禁检查的段落。`,
         metadata: {
           chapterId,
           draftId,
@@ -999,6 +1109,34 @@ async function buildRichAgentContext(projectId: string, agentType: string, state
         }
       : undefined
 
+    // Ensure chapters table has a row — otherwise findNextChapter + commitDraft break
+    if (targetChapter) {
+      const existingChapter = db.prepare(
+        'SELECT id, title FROM chapters WHERE id = ?'
+      ).get(targetChapter.id) as { id: string; title: string } | undefined
+      if (!existingChapter) {
+        const plan = db.prepare(
+          `SELECT acp.*, va.volume_number FROM arc_chapter_plans acp
+           JOIN volume_arcs va ON acp.arc_id = va.id
+           WHERE acp.id = ? LIMIT 1`
+        ).get(targetChapter.id) as Record<string, unknown> | undefined
+        const volNum = (plan?.volume_number as number) ?? 1
+        const volTitle = `第${volNum}卷`
+        let volId = (db.prepare(
+          "SELECT id FROM volumes WHERE project_id = ? AND title = ?"
+        ).get(projectId, volTitle) as { id: string } | undefined)?.id
+        if (!volId) {
+          volId = uuid()
+          db.prepare('INSERT INTO volumes (id, project_id, title, sort_order) VALUES (?, ?, ?, ?)').run(volId, projectId, volTitle, volNum)
+        }
+        db.prepare(
+          `INSERT INTO chapters (id, volume_id, project_id, title, content, plain_text, sort_order, word_count, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, '', '', ?, 0, 'draft', ?, ?)`
+        ).run(targetChapter.id, volId, projectId, targetChapter.title, targetChapter.sort_order, now(), now())
+        console.log('[Host] ensured chapters row', { chapterId: targetChapter.id.slice(0, 8) })
+      }
+    }
+
     // Auto-create chapter from arc_chapter_plan if missing
     if (!targetChapter) {
       const plan = db.prepare(
@@ -1122,13 +1260,17 @@ function getSubAgentPrompt(agentType: string, task: string): string {
 1. 从 context 的 targetChapterId 获取目标章节ID，所有工具调用都必须使用这个 chapter_id。如果 context 中没有 targetChapterId，说明章节未初始化，应报错等待重试。
 2. 检查 context 中的 arcChapterPlan（章节目标、场景列表、预估字数、伏笔计划），严格遵守。章节标题必须使用 plan 中的 chapter_title，不得修改。
 3. 检查 context 中的 chapter_contract（必需要素 required_beats、禁止动作 forbidden_moves、钩子目标 hook_goal）和 knowledge_contract（角色已知/未知/读者可见/禁止推断）。
-4. 制定章节计划（plan_chapter）时，必须将 contract 中的 required_beats 拆分为具体场景、将 forbidden_moves 标注为计划中的禁区。plan_content 字段应包含「必需要素」「禁止动作」「钩子目标」三个小节。
-5. novel_context — 加载上下文（前情摘要、角色状态、伏笔、RAG 记忆、导入文档）。
-6. write_chapter_body — 撰写整章正文。chapter_id 使用 context 中的 targetChapterId。正文必须覆盖所有 required_beats，避免所有 forbidden_moves。
-7. consistency_check — 逐条对照 contract 和 knowledge_contract 检查一致性。
-8. request_draft_review — 请求提交草稿。chapter_id 使用 targetChapterId。
+4. 制定章节计划（create_chapter_plan）时，必须将 contract 中的 required_beats 拆分为具体场景、将 forbidden_moves 标注为计划中的禁区。
+5. novel_context — 加载上下文。
+6. 如果任务要求"重写"或"打磨"，先调用 get_previous_gate_verdicts 查询上一版的违规详情，针对违规点制定修复计划。
+7. write_chapter_body — 撰写正文。chapter_id 使用 context 中的 targetChapterId。
+   - 首次写作：完整写出全章，覆盖所有 required_beats，避免所有 forbidden_moves。
+   - 重写模式（chapter_rewrite）：如果违规类型是 missing_beat（缺失必要节拍），将这些节拍作为新段落插入正文——是新增内容，不是修改已有文字。保留上一版中正确的段落不动。其他违规（节奏、一致性等）修改对应段落。
+   - 打磨模式（polishing）：只修改涉及违规的具体段落，不要重写整章，不要动无违规的段落。
+8. consistency_check — 对照 contract 逐一验证每个 required_beat 是否已在正文中出现。
+9. request_draft_review — 请求门禁检查。只调用一次，调用后等待结果。
 
-每章完整执行上述流程一次。只做当前任务要求的事。完成后返回结果。`
+每章完整执行上述流程一次。完成后返回结果。`
     case 'editor':
       return `你是小说编辑。完成分配给你的评审或摘要任务。只做当前任务。`
     default: return 'You are a helpful assistant.'
@@ -1777,7 +1919,18 @@ export class Host {
         const currentReminder = generateReminder(currentState)
         const nextInst = Route(currentState)
         const recoveryAction = decideRecoveryAction(this.projectId, currentState)
-        const nextAction = recoveryAction ?? decideHostAction(currentState, nextInst)
+        let nextAction = recoveryAction ?? decideHostAction(currentState, nextInst)
+
+        // Preserve gate transition state from being overwritten by Router
+        const currentOrchestratorState = (stateField(this.projectId, 'orchestrator_state') as string) ?? null
+        const GATE_TRANSITIONS = new Set(['chapter_rewrite', 'polishing', 'plan_gate'])
+        if (currentOrchestratorState && GATE_TRANSITIONS.has(currentOrchestratorState) && nextAction.type !== 'recover') {
+          const gateAction = rebuildGateActionFromVerdict(this.projectId, currentState, currentOrchestratorState)
+          if (gateAction) {
+            nextAction = gateAction
+          }
+        }
+
         syncExecutionState(this.projectId, currentState, nextInst, nextAction)
 
         console.log('[Host] turn', {

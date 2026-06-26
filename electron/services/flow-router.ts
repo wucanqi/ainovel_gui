@@ -77,12 +77,13 @@ export function LoadState(projectId: string): RouteState {
   const chapterReadiness = buildChapterReadiness(projectId, nextChapterInfo?.id ?? null, nextCh, nextChapterInfo?.title ?? null)
   const arcBoundary = lastCompleted > 0 ? detectArcBoundary(projectId) : null
 
-  let hasArcReview = false; let hasArcSummary = false; let hasVolumeSummary = false
+  let hasArcReview = false; let hasArcSummary = false; let hasVolumeSummary = false; let hasVolumeReview = false
   if (arcBoundary?.isArcEnd) {
     hasArcReview = !!db.prepare("SELECT 1 FROM review_records WHERE project_id = ? AND review_type = 'arc' ORDER BY created_at DESC LIMIT 1").get(projectId)
     hasArcSummary = !!db.prepare('SELECT 1 FROM arc_summaries WHERE project_id = ? ORDER BY created_at DESC LIMIT 1').get(projectId)
     if (arcBoundary.isVolumeEnd) {
       hasVolumeSummary = !!db.prepare('SELECT 1 FROM volume_summaries WHERE project_id = ? ORDER BY created_at DESC LIMIT 1').get(projectId)
+      hasVolumeReview = !!db.prepare("SELECT 1 FROM review_records WHERE project_id = ? AND review_type = 'volume' ORDER BY created_at DESC LIMIT 1").get(projectId)
     }
   }
 
@@ -99,6 +100,7 @@ export function LoadState(projectId: string): RouteState {
     hasArcReview,
     hasArcSummary,
     hasVolumeSummary,
+    hasVolumeReview,
     foundationMissing,
     chapterReadiness
   }
@@ -229,12 +231,24 @@ export function detectFoundationMissing(projectId: string): string[] {
 // ── Helper: find next chapter to write ──
 
 function findNextChapter(projectId: string, completed: number[]): number {
-  // Try committed drafts first
   const db = getDb()
-  const lastDraft = db.prepare(
-    "SELECT c.sort_order FROM chapter_drafts d JOIN chapters c ON d.chapter_id = c.id WHERE d.project_id = ? AND d.lifecycle = 'final_committed' ORDER BY c.sort_order DESC LIMIT 1"
-  ).get(projectId) as { sort_order: number } | undefined
-  if (lastDraft) return lastDraft.sort_order + 1
+  // Try committed drafts first — two-step query to avoid JOIN dependency on chapters table
+  const lastDraftRow = db.prepare(
+    "SELECT d.chapter_id FROM chapter_drafts d WHERE d.project_id = ? AND d.lifecycle = 'final_committed' ORDER BY d.generated_at DESC LIMIT 1"
+  ).get(projectId) as { chapter_id: string } | undefined
+  if (lastDraftRow) {
+    // Look up sort_order from chapters or arc_chapter_plans
+    const chRow = db.prepare(
+      'SELECT sort_order FROM chapters WHERE id = ?'
+    ).get(lastDraftRow.chapter_id) as { sort_order: number } | undefined
+    if (chRow) return chRow.sort_order + 1
+    const planRow = db.prepare(
+      `SELECT acp.chapter_number FROM arc_chapter_plans acp
+       JOIN volume_arcs va ON acp.arc_id = va.id
+       WHERE acp.id = ? AND va.project_id = ? LIMIT 1`
+    ).get(lastDraftRow.chapter_id, projectId) as { chapter_number: number } | undefined
+    if (planRow) return planRow.chapter_number + 1
+  }
 
   // Then try arc_chapter_plans for the first unwritten chapter
   const firstPlan = db.prepare(

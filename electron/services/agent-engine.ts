@@ -222,6 +222,13 @@ function buildSystemPrompt(agentType: AgentType): string {
 - 只有章节被系统 commit 后，才能使用 create_chapter_summary 与更新角色状态、关系、世界状态、伏笔状态
 - 使用 set_next_chapter_hint 设定下一章衔接提示
 
+**门禁退回处理（重要）：**
+- 如果任务描述中包含"详细违规点"，表示上一版草稿被门禁退回，你必须先逐条分析违规原因再动笔
+- 如果是 polishing 模式（打磨）：先调用 get_previous_gate_verdicts 查询违规历史，只修改涉及违规的段落，不要重写整章
+- 如果是 chapter_rewrite 模式（重写）：先调用 get_previous_gate_verdicts 查询违规历史，重写时逐条对照确保不触发同样问题
+- 修改后必须调用 consistency_check 自检，确认违规已修复
+- 不得盲目重复送审——如果同一问题连续出现，主动在 summary 中说明阻塞原因
+
 **注意事项：**
 - 你只负责当前章节，不要决定全局方向
 - 严格遵循上下文提供的弧目标、角色状态、伏笔计划

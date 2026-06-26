@@ -109,11 +109,36 @@ export function commitDraft(draftId: string): { success: boolean; chapterId: str
   if (!draft) throw new Error('Draft not found')
 
   const ts = now()
-  db.prepare(
-    `UPDATE chapters
-     SET content = ?, plain_text = ?, word_count = ?, status = 'draft', updated_at = ?
-     WHERE id = ?`
-  ).run(draft.content, draft.plain_text, draft.word_count, ts, draft.chapter_id)
+  const existingChapter = db.prepare('SELECT id FROM chapters WHERE id = ?').get(draft.chapter_id) as { id: string } | undefined
+  if (existingChapter) {
+    db.prepare(
+      `UPDATE chapters
+       SET content = ?, plain_text = ?, word_count = ?, status = 'draft', updated_at = ?
+       WHERE id = ?`
+    ).run(draft.content, draft.plain_text, draft.word_count, ts, draft.chapter_id)
+  } else {
+    // Chapters row missing — auto-create before commit
+    const plan = db.prepare(
+      `SELECT acp.chapter_title, acp.chapter_number, va.volume_number
+       FROM arc_chapter_plans acp
+       JOIN volume_arcs va ON acp.arc_id = va.id
+       WHERE acp.id = ? LIMIT 1`
+    ).get(draft.chapter_id) as Record<string, unknown> | undefined
+    const title = (plan?.chapter_title as string) || `第${plan?.chapter_number ?? '?'}章`
+    const volNum = (plan?.volume_number as number) ?? 1
+    const volTitle = `第${volNum}卷`
+    let volId = (db.prepare("SELECT id FROM volumes WHERE project_id = ? AND title = ?").get(draft.project_id, volTitle) as { id: string } | undefined)?.id
+    if (!volId) {
+      volId = uuid()
+      db.prepare('INSERT INTO volumes (id, project_id, title, sort_order) VALUES (?, ?, ?, ?)').run(volId, draft.project_id, volTitle, volNum)
+    }
+    const sortOrder = (plan?.chapter_number as number) ?? 1
+    db.prepare(
+      `INSERT INTO chapters (id, volume_id, project_id, title, content, plain_text, sort_order, word_count, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)`
+    ).run(draft.chapter_id, volId, draft.project_id, title, draft.content, draft.plain_text, sortOrder, draft.word_count, ts, ts)
+    console.log('[draft] commitDraft auto-created chapters row', { chapterId: draft.chapter_id.slice(0, 8) })
+  }
 
   db.prepare(
     `UPDATE chapter_drafts SET lifecycle = 'final_committed', committed_at = ? WHERE id = ?`

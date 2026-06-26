@@ -27,6 +27,9 @@ export interface GateVerdict {
   summary: string
   recommended_model: string
   reports: GateCheckResult[]
+  previous_violations_resolved?: number
+  previous_violations_remain?: number
+  consecutive_failures?: number
 }
 
 const INFERENCE_PATTERNS: Record<string, RegExp> = {
@@ -492,13 +495,13 @@ export function determineVerdict(reports: GateCheckResult[]): GateVerdictType {
 
   const contractReport = reports.find((r) => r.check_type === 'contract')
   if (contractReport) {
-    const missingBeats = contractReport.violations.filter(
+    const criticalMissingBeats = contractReport.violations.filter(
       (v) => v.type === 'missing_beat' && v.severity === 'critical'
     )
-    const totalBeats = contractReport.violations.filter(
+    const totalMissingBeats = contractReport.violations.filter(
       (v) => v.type === 'missing_beat'
     ).length
-    if (totalBeats > 0 && missingBeats.length === totalBeats) {
+    if (totalMissingBeats > 0 && criticalMissingBeats.length === totalMissingBeats) {
       return 'replan'
     }
   }
@@ -518,6 +521,13 @@ export function determineVerdict(reports: GateCheckResult[]): GateVerdictType {
   if (criticalCount > 0 && criticalCount <= 2) {
     return 'rewrite'
   }
+
+  // missing_beat with error severity — means content is missing, not just needs editing
+  // cannot be fixed by polish; must rewrite to add the missing beats as new content
+  const missingBeatCount = reports.flatMap((r) =>
+    r.violations.filter((v) => v.type === 'missing_beat' && v.severity === 'error')
+  ).length
+  if (missingBeatCount > 0) return 'rewrite'
 
   const hasError = reports.some((r) =>
     r.violations.some((v) => v.severity === 'error')
@@ -655,12 +665,109 @@ export async function runDraftGate(draftId: string): Promise<GateVerdict> {
     reports
   }
 
+  const prevComparison = compareWithPreviousDraft(draft.project_id, draft.chapter_id, draft.version, reports)
+  if (prevComparison) {
+    const compareParts: string[] = []
+    if (prevComparison.resolved > 0) compareParts.push(`${prevComparison.resolved} 个已修复`)
+    if (prevComparison.remaining > 0) compareParts.push(`${prevComparison.remaining} 个仍存在`)
+    if (prevComparison.newCount > 0) compareParts.push(`${prevComparison.newCount} 个新增`)
+    verdict.summary += `（对比上一版：${compareParts.join('，')}）`
+    verdict.previous_violations_resolved = prevComparison.resolved
+    verdict.previous_violations_remain = prevComparison.remaining
+  }
+
+  const consecutiveFailures = countConsecutiveDraftFailures(draft.project_id, draft.chapter_id)
+  if (!overallPassed && consecutiveFailures > 0) {
+    verdict.consecutive_failures = consecutiveFailures
+    verdict.summary += ` | 本章连续失败 ${consecutiveFailures} 次`
+  }
+
   saveGateReports(draftId, draft.project_id, draft.chapter_id, reports)
   saveGateVerdict(draftId, draft.project_id, draft.chapter_id, verdict)
 
   void chatLLM
   void getLatestDraft
   return verdict
+}
+
+function compareWithPreviousDraft(
+  projectId: string,
+  chapterId: string,
+  currentVersion: number,
+  currentReports: GateCheckResult[]
+): { resolved: number; remaining: number; newCount: number } | null {
+  const db = getDb()
+  const prevDraft = db.prepare(
+    `SELECT id, version FROM chapter_drafts
+     WHERE project_id = ? AND chapter_id = ? AND version < ?
+     ORDER BY version DESC LIMIT 1`
+  ).get(projectId, chapterId, currentVersion) as { id: string; version: number } | undefined
+  if (!prevDraft) return null
+
+  const prevVerdict = db.prepare(
+    `SELECT id FROM draft_gate_verdicts WHERE draft_id = ? AND chapter_id = ? ORDER BY created_at DESC LIMIT 1`
+  ).get(prevDraft.id, chapterId) as { id: string } | undefined
+  if (!prevVerdict) return null
+
+  const prevReportRows = db.prepare(
+    `SELECT violations FROM draft_gate_reports WHERE draft_id = ?`
+  ).all(prevDraft.id) as Array<{ violations: string }>
+
+  const prevViolations = new Set<string>()
+  for (const row of prevReportRows) {
+    try {
+      const parsed = JSON.parse(row.violations)
+      for (const v of (parsed || [])) {
+        prevViolations.add(v.type as string)
+      }
+    } catch { /* skip */ }
+  }
+
+  const currentViolations = new Set<string>()
+  for (const report of currentReports) {
+    for (const v of (report.violations || [])) {
+      currentViolations.add(v.type)
+    }
+  }
+
+  let resolved = 0
+  let remaining = 0
+  let newCount = 0
+
+  for (const prevType of prevViolations) {
+    if (currentViolations.has(prevType)) {
+      remaining++
+    } else {
+      resolved++
+    }
+  }
+  for (const curType of currentViolations) {
+    if (!prevViolations.has(curType)) {
+      newCount++
+    }
+  }
+
+  return { resolved, remaining, newCount }
+}
+
+function countConsecutiveDraftFailures(projectId: string, chapterId: string): number {
+  const db = getDb()
+  const rows = db.prepare(
+    `SELECT dgv.overall_passed FROM draft_gate_verdicts dgv
+     JOIN chapter_drafts d ON dgv.draft_id = d.id
+     WHERE d.project_id = ? AND d.chapter_id = ?
+     ORDER BY d.version DESC
+     LIMIT 10`
+  ).all(projectId, chapterId) as Array<{ overall_passed: number }>
+  let count = 0
+  for (const row of rows) {
+    if (row.overall_passed === 0) {
+      count++
+    } else {
+      break
+    }
+  }
+  return count
 }
 
 type ChapterPlanRow = {
@@ -692,7 +799,7 @@ function planTextFromRow(plan: ChapterPlanRow): string {
 export async function runPlanGate(projectId: string, chapterId: string): Promise<GateVerdict> {
   const plan = getLatestChapterPlan(chapterId)
   if (!plan) {
-    return {
+    const verdict: GateVerdict = {
       verdict: 'replan',
       overall_passed: false,
       fail_count: 1,
@@ -712,6 +819,8 @@ export async function runPlanGate(projectId: string, chapterId: string): Promise
         }
       ]
     }
+    savePlanGateVerdict(projectId, chapterId, 'null', verdict)
+    return verdict
   }
 
   const planText = planTextFromRow(plan)
@@ -748,7 +857,7 @@ export async function runPlanGate(projectId: string, chapterId: string): Promise
   const failCount = reports.filter((r) => !r.passed).length
   const overallPassed = reports.every((r) => r.passed)
 
-  return {
+  const verdict: GateVerdict = {
     verdict: verdictType,
     overall_passed: overallPassed,
     fail_count: failCount,
@@ -759,4 +868,35 @@ export async function runPlanGate(projectId: string, chapterId: string): Promise
     recommended_model: verdictType === 'escalate' ? 'pro' : 'flash',
     reports
   }
+
+  savePlanGateVerdict(projectId, chapterId, plan.id, verdict)
+  return verdict
+}
+
+export function savePlanGateVerdict(
+  projectId: string,
+  chapterId: string,
+  planId: string,
+  verdict: GateVerdict
+): void {
+  getDb()
+    .prepare(
+      `INSERT INTO plan_gate_verdicts
+       (id, project_id, chapter_id, plan_id, verdict, overall_passed, fail_count, critical_count, summary, recommended_model, reports_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      uuid(),
+      projectId,
+      chapterId,
+      planId,
+      verdict.verdict,
+      verdict.overall_passed ? 1 : 0,
+      verdict.fail_count,
+      verdict.critical_count,
+      verdict.summary,
+      verdict.recommended_model,
+      JSON.stringify(verdict.reports ?? []),
+      now()
+    )
 }

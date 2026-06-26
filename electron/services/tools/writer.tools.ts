@@ -475,7 +475,118 @@ const report_chapter_done: ToolDefinition = {
   }
 }
 
+const get_previous_gate_verdicts: ToolDefinition = {
+  name: 'get_previous_gate_verdicts',
+  description: '查询本章节最近的门禁判决历史。当任务要求打磨或重写时，先调用此工具了解上一版草稿或章节计划有哪些违规，再制定修复计划。能获取草案门禁(draft_gate)和计划门禁(plan_gate)的历史判决。',
+  parameters: {
+    type: 'object',
+    properties: {
+      chapter_id: { type: 'string', description: '章节ID' },
+      limit: { type: 'number', description: '获取最近N条判决，默认3' }
+    },
+    required: ['chapter_id']
+  },
+  async handler(_projectId, args) {
+    const chapterId = args.chapter_id as string
+    const limit = (args.limit as number) ?? 3
+    const db = getDb()
+
+    const draftVerdicts = db.prepare(
+      `SELECT dgv.id, dgv.verdict, dgv.overall_passed, dgv.fail_count, dgv.critical_count,
+              dgv.summary, dgv.recommended_model, dgv.created_at, d.version as draft_version,
+              'draft_gate' as gate_type
+       FROM draft_gate_verdicts dgv
+       JOIN chapter_drafts d ON dgv.draft_id = d.id
+       WHERE dgv.chapter_id = ?
+       ORDER BY dgv.created_at DESC
+       LIMIT ?`
+    ).all(chapterId, limit) as Array<Record<string, unknown>>
+
+    const planVerdicts = db.prepare(
+      `SELECT pgv.id, pgv.verdict, pgv.overall_passed, pgv.fail_count, pgv.critical_count,
+              pgv.summary, pgv.recommended_model, pgv.created_at, pgv.reports_json,
+              'plan_gate' as gate_type
+       FROM plan_gate_verdicts pgv
+       WHERE pgv.chapter_id = ?
+       ORDER BY pgv.created_at DESC
+       LIMIT ?`
+    ).all(chapterId, limit) as Array<Record<string, unknown>>
+
+    const allVerdicts = [...draftVerdicts, ...planVerdicts]
+      .sort((a, b) => (b.created_at as number) - (a.created_at as number))
+      .slice(0, limit)
+
+    const latestDraft = allVerdicts.find((v) => v.gate_type === 'draft_gate')
+    const latestPlan = allVerdicts.find((v) => v.gate_type === 'plan_gate')
+
+    const extractViolations = (verdict: Record<string, unknown>): Array<Record<string, unknown>> => {
+      if (verdict.gate_type === 'plan_gate' && verdict.reports_json) {
+        try {
+          const reports = JSON.parse(verdict.reports_json as string)
+          const violations: Array<Record<string, unknown>> = []
+          for (const r of reports) {
+            for (const v of (r.violations || [])) {
+              violations.push({ check_type: r.check_type, type: v.type, severity: v.severity, detail: v.detail })
+            }
+          }
+          return violations
+        } catch { return [] }
+      }
+      if (verdict.gate_type === 'draft_gate') {
+        const reports = db.prepare(
+          `SELECT check_type, violations, severity FROM draft_gate_reports WHERE draft_id IN
+           (SELECT d.id FROM chapter_drafts d JOIN draft_gate_verdicts dgv ON d.id = dgv.draft_id WHERE dgv.id = ?)`
+        ).all(verdict.id as string) as Array<{ check_type: string; violations: string; severity: string }>
+        const violations: Array<Record<string, unknown>> = []
+        for (const r of reports) {
+          try {
+            const parsed = JSON.parse(r.violations)
+            for (const v of (parsed || [])) {
+              violations.push({ check_type: r.check_type, type: v.type, severity: v.severity, detail: v.detail })
+            }
+          } catch { /* skip malformed JSON */ }
+        }
+        return violations
+      }
+      return []
+    }
+
+    return {
+      success: true,
+      data: {
+        chapter_id: chapterId,
+        total_verdicts: allVerdicts.length,
+        latest_draft_verdict: latestDraft ? {
+          verdict: latestDraft.verdict,
+          overall_passed: latestDraft.overall_passed,
+          fail_count: latestDraft.fail_count,
+          critical_count: latestDraft.critical_count,
+          summary: latestDraft.summary,
+          draft_version: latestDraft.draft_version,
+          violations: extractViolations(latestDraft)
+        } : null,
+        latest_plan_verdict: latestPlan ? {
+          verdict: latestPlan.verdict,
+          overall_passed: latestPlan.overall_passed,
+          fail_count: latestPlan.fail_count,
+          critical_count: latestPlan.critical_count,
+          summary: latestPlan.summary,
+          violations: extractViolations(latestPlan)
+        } : null,
+        recent_verdicts: allVerdicts.map((v) => ({
+          gate_type: v.gate_type,
+          verdict: v.verdict,
+          overall_passed: v.overall_passed,
+          summary: v.summary,
+          created_at: v.created_at
+        }))
+      }
+    }
+  }
+}
+
 export const writerTools: ToolDefinition[] = [
+  get_previous_gate_verdicts,
   create_chapter_plan,
   get_chapter_contract,
   get_knowledge_contract,
