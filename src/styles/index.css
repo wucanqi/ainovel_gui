@@ -1,0 +1,111 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: #0f1115;
+  color: #e6e8ee;
+  font-family: Inter, -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #2a2f3d;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #353b4d;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.prose-editor {
+  outline: none;
+  min-height: 60vh;
+  color: #e6e8ee;
+  font-size: 16px;
+  line-height: 1.9;
+  letter-spacing: 0.02em;
+}
+.prose-editor:focus {
+  outline: none;
+}
+.prose-editor p {
+  margin: 0 0 1em;
+}
+.prose-editor p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  float: left;
+  color: #6b7185;
+  pointer-events: none;
+  height: 0;
+}
+.prose-editor h1 {
+  font-size: 1.5em;
+  font-weight: 600;
+  margin: 1.2em 0 0.6em;
+}
+.prose-editor h2 {
+  font-size: 1.25em;
+  font-weight: 600;
+  margin: 1em 0 0.5em;
+}
+.prose-editor h3 {
+  font-size: 1.1em;
+  font-weight: 600;
+  margin: 0.8em 0 0.4em;
+}
+.prose-editor blockquote {
+  border-left: 3px solid #353b4d;
+  padding-left: 1em;
+  margin: 1em 0;
+  color: #a6abbb;
+}
+.prose-editor ul,
+.prose-editor ol {
+  padding-left: 1.5em;
+  margin: 0 0 1em;
+}
+.prose-editor li {
+  margin: 0.2em 0;
+}
+.prose-editor code {
+  background: #1d212c;
+  padding: 0.1em 0.4em;
+  border-radius: 3px;
+  font-size: 0.9em;
+}
+.prose-editor pre {
+  background: #1d212c;
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin: 0 0 1em;
+}
+.prose-editor pre code {
+  background: transparent;
+  padding: 0;
+}
+.prose-editor hr {
+  border: none;
+  border-top: 1px solid #262b38;
+  margin: 2em 0;
+}
